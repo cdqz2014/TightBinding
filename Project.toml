@@ -1,0 +1,8 @@
+name = "TightBinding"
+uuid = "43b0fc92-1a5e-46a4-8f03-3740899210f6"
+authors = ["Xiaodong Hu <xiaodong.hu@bc.edu>"]
+version = "0.1.0"
+
+[deps]
+Match = "7eb4fadd-790c-5f42-8a69-bfa0b872bfbf"
+SymEngine = "123dc426-2d89-5057-bbad-38513e3affd8"

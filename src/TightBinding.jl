@@ -27,7 +27,7 @@ struct TB_Model_with_Parameter <: Model
 	H_cartesian::Matrix{SymEngine.Basic}
 end
 
-struct Bilinear # [adagger].amplitude.[a]
+struct Bilinear # [adagger]_{to_site}.amplitude.[a]_{from_site}
 	to_site::Vector{Int64}
 	from_site::Vector{Int64}
 	amplitude::ComplexF64
@@ -37,10 +37,22 @@ struct TB_Model <: Model
 	model_with_parameter::TB_Model_with_Parameter
 	parameter_settings::Dict{SymEngine.Basic, Float64}
 
-	#lambdified if symoolic_q=true
-	Hk_crystal::Function # typeof(Hk_crystal) and typeof(Hk_cartesian) are strangely NOT regarded as the same by default
+	Hk_crystal::Function
 	Hk_cartesian::Function
 	hopping_term_list::Vector{Bilinear}
+end
+
+
+struct TB_Sample <: Sample
+	tb_model::TB_Model
+	sample_size::Vector{Int64}
+	boundary_flux::Vector{Int64}
+	temperature::Float64
+
+	# states are labelled with a tuple (i,j,k,nsub)
+	state_to_r_crystal_hashmap::Dict{NTuple{4,Int64}, Vector{Float64}}
+	state_to_k_crystal_hashmap::Dict{NTuple{4,Int64}, Vector{Float64}}
+	state_to_eigs_hashmap::Dict{NTuple{4,Int64},Tuple{Float64, Vector{ComplexF64}}}
 end
 
 
@@ -60,11 +72,11 @@ SymEngine_var_creation(s::Symbol) = SymEngine_var_creation(string(s))
 ###============== Main Generation Functions Start Here =============###
 ###=================================================================###
 """
-#### Initialize the Tightbinding Model with Parameters.
+#### Initialize a Tightbinding Model with Parameters.
 > The structure is read from the file `tb_model.txt` by default, but you can assign by yourself through
 > ```julia
-initialize_model_with_param(tb_filename="...")
-```
+> initialize_model_with_param(tb_filename="...")
+> ```
 """
 function initialize_model_with_param(; tb_filename::String="tb_model.txt")
 	model_name = ""
@@ -179,6 +191,7 @@ function initialize_model_with_param(; tb_filename::String="tb_model.txt")
 			reciprocal_basis_vectors,
 			k_crystal,
 			k_cartesian,
+			
 			hopping_hashmap,
 			H_crystal,
 			H_cartesian
@@ -187,11 +200,11 @@ end
 
 
 """
-#### Initialize the Tightbinding Model with All Parameters Set
+#### Initialize a Tightbinding Model with All Parameters Set
 > The structure is read from the file `tb_model.txt` by default, but you can still assign by yourself. The parameter settings are set to be an empty tuple `param=()` of unkown element of type `Tuple{Pair{String, Float64}}` by default (thanks to `Type{Vararg}`). But you can insert through
 > ```julia
-initialize_model_with_param(param = ("mu"=>1.0,"nu"=>2.0, ...); tb_filename="...")
-```
+> initialize_model_with_param(param = ("mu"=>1.0,"nu"=>2.0, ...); tb_filename="...")
+> ```
 """
 function initialize_model(param::Tuple{T, Vararg{T}}=(); tb_filename::String="tb_model.txt") where T<:Pair{String, Float64}
 	model = initialize_model_with_param(; tb_filename)
@@ -237,9 +250,77 @@ function initialize_model(param::Tuple{T, Vararg{T}}=(); tb_filename::String="tb
 end
 
 
+
+"""
+#### realize a Finite-size Tightbinding Sample
+> The sample size is set through, for example:
+> ```julia
+> initialize_sample(model; sample_size=[6,6,6], boundary_flux=[0,0,0], tempearture=1.0E-6)
+> ```
+> We use `(i,j,k,nsub)` to label the states, so that each physical quantities `Q` of the sample is saved as a `HashMap<state,Q>`. Note: here for consistency we keep the third index (=1) even for two-dimensional systems.
+"""
+function initialize_sample(model::TB_Model; sample_size::Vector{Int64}=[6,6,6], boundary_flux::Vector{Int64}=[0,0,0], temperature::Float64=1.0E-6)
+	let m = model.model_with_parameter
+		L_tuple = (Lx,Ly,Lz) = tuple(sample_size...)
+		@assert Lx>0 && Ly>0 && Lz>0
+		L_tot = reduce(*, L_tuple)
+
+		dim = m.dim
+		nsub = m.nsub
+
+		# we use the tuple `(i,j,k,nsub)` to denote each state (if the tightbinding model is a two-dimensional system, then `k` is always 1)
+		state_to_k_crystal_hashmap = Dict{NTuple{4, Int64}, Vector{Float64}}()
+		sizehint!(state_to_k_crystal_hashmap, L_tot*nsub)
+		for i in 1:Lx, j in 1:Ly, k in 1:Lz, sub in 1:nsub
+			state_to_k_crystal_hashmap[(i,j,k,sub)] = [
+				((i-1)*2*pi+boundary_flux[1])/Lx,
+				((j-1)*2*pi+boundary_flux[2])/Ly,
+				((k-1)*2*pi+boundary_flux[3])/Lz
+			]
+		end
+
+		state_to_r_crystal_hashmap = Dict{NTuple{4, Int64}, Vector{Float64}}()
+		sizehint!(state_to_r_crystal_hashmap, L_tot*nsub)
+		for i in 1:Lx, j in 1:Ly, k in 1:Lz, sub in 1:nsub
+			state_to_r_crystal_hashmap[(i,j,k,sub)] = begin
+				@match dim begin
+					2 => _r_crystal([i,j,sub], m.sublattice_positions)
+					3 => _r_crystal([i,j,k,sub], m.sublattice_positions)
+				end
+			end
+		end
+		
+		state_to_eigs_hashmap = Dict{NTuple{4, Int64}, Tuple{Float64, Vector{ComplexF64}}}()
+		sizehint!(state_to_eigs_hashmap, L_tot*nsub)
+		for (key, val) in state_to_k_crystal_hashmap
+			let k_crystal_point = collect(val)
+				eigs = eigen_k_crystal(k_crystal_point, model)
+				let sub = key[end]
+					state_to_eigs_hashmap[key] = @inbounds (eigs.values[sub], eigs.vectors[:,sub])
+				end
+			end
+		end
+
+		@show state_to_eigs_hashmap
+
+		return TB_Sample(
+			model,
+			sample_size,
+			boundary_flux,
+			temperature,
+
+			state_to_r_crystal_hashmap,
+			state_to_k_crystal_hashmap,
+			state_to_eigs_hashmap
+		)
+	end
+end
+
+
 ###=================================================================###
-###============= Physical Auxilary Functions Start Here ============###
+###================= Auxilary Function Start Here ==================###
 ###=================================================================###
+"push one hopping term to the symbolic Hamiltonian"
 @inline function _add_one_term_to_H_crystal!(to_site::Vector{Int64}, from_site::Vector{Int64}, t::SymEngine.Basic, sublattice_positions::Vector{Vector{Float64}}, k_crystal::Vector{SymEngine.Basic}, H_crystal::Matrix{SymEngine.Basic})
 	from_site_position = _r_crystal(from_site, sublattice_positions)
 	to_site_position = _r_crystal(to_site, sublattice_positions)
@@ -247,9 +328,17 @@ end
 	φ = dot(displacement, k_crystal)
 	H_crystal[to_site[end], from_site[end]] += t*exp(-im*φ)
 end
-@inline function _r_crystal(site::Vector{Int64}, sublattice_positions::Vector{Vector{Float64}})
-	# recall that the i-th sublattice vector is saved as sublattice_positions[:,i], see line 78
+
+"get the crystal coordinate for a given site [i,j,k,sub]"
+@inline function _r_crystal(site::Vector{Int64}, sublattice_positions::Vector{Vector{Float64}})::Vector{Float64}
 	return site[1:end-1] + sublattice_positions[site[end]]
+end
+
+"return the eigen system at k_crystal_point [i,j,k]"
+@inline function eigen_k_crystal(k_crystal_point::Vector{Float64}, model::TB_Model)
+	let dim = model.model_with_parameter.dim
+		return eigen(Hermitian(model.Hk_crystal(k_crystal_point[1:dim]...)))
+	end
 end
 
 end
